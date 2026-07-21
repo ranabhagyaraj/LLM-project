@@ -539,6 +539,8 @@ def run_load_checkpoint(
     raise NotImplementedError
 
 
+
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -560,6 +562,8 @@ def get_tokenizer(
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
     raise NotImplementedError
+
+
 
 
 def run_train_bpe(
@@ -589,4 +593,133 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+
+    import os
+    import regex as re
+    from typing import Any
+
+    def find_chunk_boundaries(
+        file,
+        desired_num_chunks,
+        split_special_token,
+    ):
+        assert isinstance(split_special_token, bytes)
+
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
+
+        chunk_size = file_size // desired_num_chunks
+
+        chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+        chunk_boundaries[-1] = file_size
+
+        mini_chunk_size = 4096
+
+        for bi in range(1, len(chunk_boundaries) - 1):
+            initial_position = chunk_boundaries[bi]
+            file.seek(initial_position)
+            while True:
+                mini_chunk = file.read(mini_chunk_size)
+                if mini_chunk == b"":
+                    chunk_boundaries[bi] = file_size
+                    break
+                found_at = mini_chunk.find(split_special_token)
+                if found_at != -1:
+                    chunk_boundaries[bi] = initial_position + found_at
+                    break
+                initial_position += mini_chunk_size
+
+        return sorted(set(chunk_boundaries))
+
+
+    vocab: dict[int, bytes] = {byte_id: bytes([byte_id]) for byte_id in range(256)}
+
+    # 2. Add Special Tokens starting at index 256
+    for st in special_tokens:
+        vocab[len(vocab)] = st.encode("utf-8")
+
+    merges_list: list[tuple[bytes, bytes]] = []
+    next_id = len(vocab)
+    number_of_merges = vocab_size - len(vocab)
+
+    # GPT-2 pre-tokenization regex pattern
+    gpt2_split_pattern = re.compile(
+        r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""",
+        re.IGNORECASE,
+    )
+
+    word_freq: dict[tuple[int, ...], int] = {}
+
+    special_pattern = None
+    if special_tokens:
+        special_pattern = re.compile("|".join(re.escape(st) for st in special_tokens))
+
+    with open(input_path, "rb") as f:
+        content = f.read().decode("utf-8", errors="ignore")
+        if special_pattern:
+            chunks = special_pattern.split(content)
+        else:
+            chunks = [content]
+
+        for chunk in chunks:
+            words = gpt2_split_pattern.findall(chunk)
+            for word in words:
+                word_bytes_ids = tuple(word.encode("utf-8"))
+                word_freq[word_bytes_ids] = word_freq.get(word_bytes_ids, 0) + 1
+
+    # 3. BPE Merging Loop
+    while number_of_merges > 0:
+        pair_counts: dict[tuple[int, int], int] = {}
+        for word_ids, freq in word_freq.items():
+            for i in range(len(word_ids) - 1):
+                pair = (word_ids[i], word_ids[i + 1])
+                pair_counts[pair] = pair_counts.get(pair, 0) + freq
+
+        if not pair_counts:
+            break
+
+        # Fix: Use key=pair_counts.get to preserve insertion-order tie-breaking
+        most_frequent_pair = max(
+            pair_counts.keys(),
+            key=lambda pair: (
+                pair_counts[pair],
+                vocab[pair[0]],
+                vocab[pair[1]],
+            ),
+        )
+
+        pair_1, pair_2 = most_frequent_pair
+
+        vocab[next_id] = vocab[pair_1] + vocab[pair_2]
+        merges_list.append((vocab[pair_1], vocab[pair_2]))
+
+        # Update word frequencies with merged pair
+        new_word_freq: dict[tuple[int, ...], int] = {}
+        for word_ids, freq in word_freq.items():
+            i = 0
+            new_ids = []
+            while i < len(word_ids):
+                if i < len(word_ids) - 1 and word_ids[i] == pair_1 and word_ids[i + 1] == pair_2:
+                    new_ids.append(next_id)
+                    i += 2
+                else:
+                    new_ids.append(word_ids[i])
+                    i += 1
+            new_word_freq[tuple(new_ids)] = freq
+
+        word_freq = new_word_freq
+        number_of_merges -= 1
+        next_id += 1
+
+    return vocab, merges_list
+
+if __name__ == "__main__":
+    
+    (run_train_bpe(
+        input_path="tests/fixtures/corpus.en",
+        vocab_size=10000,
+        special_tokens=["<|endoftext|>"]
+    ))
+
+
